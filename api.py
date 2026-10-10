@@ -588,19 +588,24 @@ def _graph_for_forecast(
 # Forecast helpers
 # ============================================================
 
-def _prime_history(
-    engine: VanguardEngine,
-    graph,
-) -> None:
-    engine.process_graph_snapshot(graph)
-
-
 def _forecast_from_request(
     request: ForecastRequest,
 ):
-    engine = _get_engine(
-        request.horizon_k
-    )
+    """
+    Build one graph snapshot and run exactly one inference pass.
+
+    VanguardEngine.process_graph_snapshot() accepts graph tensors explicitly:
+        x, edge_index, edge_attr, target_ip
+
+    The previous implementation called the engine once to "prime" history
+    and then called it again for the forecast. Because the engine itself
+    appends every processed snapshot to temporal history, that duplicated
+    the same snapshot and could distort the temporal context.
+
+    For an API request we start a fresh incident-analysis context and process
+    the supplied snapshot exactly once.
+    """
+    engine = _get_engine(request.horizon_k)
 
     graph = _graph_for_forecast(
         request.target_ip,
@@ -608,16 +613,21 @@ def _forecast_from_request(
         request.window_index,
     )
 
+    # Validate the graph contract before entering model inference.
+    if not hasattr(graph, "x") or not hasattr(graph, "edge_index") or not hasattr(graph, "edge_attr"):
+        raise HTTPException(
+            status_code=422,
+            detail="Telemetry graph is missing x, edge_index, or edge_attr.",
+        )
+
     with inference_lock:
         engine.reset_history()
 
-        _prime_history(
-            engine,
-            graph,
-        )
-
         result = engine.process_graph_snapshot(
-            graph
+            x=graph.x,
+            edge_index=graph.edge_index,
+            edge_attr=graph.edge_attr,
+            target_ip=request.target_ip,
         )
 
     return result
@@ -790,9 +800,22 @@ def forecast(
 ):
     started = time.perf_counter()
 
-    result = _forecast_from_request(
-        payload
-    )
+    try:
+        result = _forecast_from_request(payload)
+    except HTTPException:
+        raise
+    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+        logger.exception(
+            "Forecast inference failed | request_id=%s",
+            request.state.request_id,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Vanguard inference failed. "
+                "Check telemetry schema, model inputs, and dependencies."
+            ),
+        ) from exc
 
     elapsed_ms = (
         time.perf_counter() - started
@@ -879,9 +902,22 @@ def analyze(
 ):
     started = time.perf_counter()
 
-    result = _forecast_from_request(
-        payload
-    )
+    try:
+        result = _forecast_from_request(payload)
+    except HTTPException:
+        raise
+    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+        logger.exception(
+            "Combined analysis failed | request_id=%s",
+            request.state.request_id,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Vanguard analysis failed. "
+                "Check telemetry schema, model inputs, and dependencies."
+            ),
+        ) from exc
 
     elapsed_ms = (
         time.perf_counter() - started
@@ -1189,3 +1225,4 @@ if __name__ == "__main__":
         port=settings.api_port,
         reload=settings.debug,
     )
+    
